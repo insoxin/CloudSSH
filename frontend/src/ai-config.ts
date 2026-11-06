@@ -1,6 +1,7 @@
 // AI Config panel — BYOK settings for LLM API
 
 import { normalizeAIBaseUrl } from '../../src/ai-endpoint';
+import { type AIModelBudgets } from '../../src/ai-model-policy';
 import { responseErrorMessage } from './agent/response-errors';
 import { t, translateDocument } from './i18n';
 
@@ -8,7 +9,7 @@ export class AIConfigPanel {
   private modalEl: HTMLElement | null = null;
   private hasConfiguredKey = false;
   private savedBaseUrl = '';
-  private loadedModels: string[] = [];
+  private loadedModels: Array<{ id: string } & Partial<AIModelBudgets>> = [];
   private isDropdownOpen = false;
   private outsideClickListener: ((e: MouseEvent) => void) | null = null;
 
@@ -66,7 +67,7 @@ export class AIConfigPanel {
                   <input
                     id="ai-model"
                     class="terminal-input w-full text-[13px] pr-14 font-mono"
-                    placeholder="gpt-4o-mini"
+                    placeholder="gpt-6-luna"
                     type="text"
                     required
                     autocomplete="off"
@@ -297,7 +298,7 @@ export class AIConfigPanel {
     let list = this.loadedModels;
     const trimmed = filterText.trim().toLowerCase();
     if (!forceFull && trimmed) {
-      list = this.loadedModels.filter((m) => m.toLowerCase().includes(trimmed));
+      list = this.loadedModels.filter((m) => m.id.toLowerCase().includes(trimmed));
     }
 
     if (list.length === 0) {
@@ -311,9 +312,9 @@ export class AIConfigPanel {
     const currentVal = inputEl?.value.trim() || '';
     let selectedEl: HTMLElement | null = null;
 
-    for (const modelId of list) {
-      const isSelected = modelId === currentVal;
-      const itemEl = this.createOptionElement(modelId, isSelected, inputEl);
+    for (const model of list) {
+      const isSelected = model.id === currentVal;
+      const itemEl = this.createOptionElement(model.id, isSelected, inputEl);
       if (isSelected) {
         selectedEl = itemEl;
       }
@@ -457,9 +458,9 @@ export class AIConfigPanel {
         return;
       }
 
-      const models: Array<{ id: string }> = data.models || [];
-      const modelIds = models.map((m) => m.id);
-      this.loadedModels = modelIds;
+      const models: Array<{ id: string } & Partial<AIModelBudgets>> = data.models || [];
+      this.loadedModels = models.filter(model => typeof model.id === 'string' && model.id);
+      const modelIds = this.loadedModels.map(model => model.id);
 
       if (modelIds.length > 0) {
         const currentVal = modelEl?.value.trim() || '';
@@ -528,11 +529,15 @@ export class AIConfigPanel {
       return;
     }
 
+    const matched = this.loadedModels.find(item => item.id === model);
     try {
-      const body: { base_url: string; model: string; api_key?: string } = {
+      const body: { base_url: string; model: string; api_key?: string;
+        provider_context_window?: number; provider_max_output_tokens?: number } = {
         base_url: baseUrl,
         model,
       };
+      if (typeof matched?.context_window === 'number') body.provider_context_window = matched.context_window;
+      if (typeof matched?.max_output_tokens === 'number') body.provider_max_output_tokens = matched.max_output_tokens;
       if (apiKey) body.api_key = apiKey;
 
       const res = await fetch('/api/ai/config', {

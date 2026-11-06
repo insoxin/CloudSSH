@@ -1,10 +1,12 @@
 // Agent panel UI — right sidebar for AI Agent interaction
 
+import { isAgentSessionState, type AgentSessionState } from '../../../src/agent-session-state';
 import DOMPurify from 'dompurify';
 import { marked, type Tokens } from 'marked';
 import {
   formatTimestampWithRelative,
   isSensitiveKeyOrValue,
+  KNOWLEDGE_VALUE_MAX_LENGTH,
   normalizeKnowledgeInput,
   type ServerKnowledgeItem,
   type UnifiedServerMemory,
@@ -15,6 +17,7 @@ import { getLocale, onLocaleChange, t, translateDocument } from '../i18n';
 import { confirmAction, notify } from '../ui-feedback';
 import { getTerminalFillCommand, normalizeCodeLanguage } from './code-actions';
 import { responseErrorMessage } from './response-errors';
+import { agentSessionDraftKey } from './session-draft';
 import {
   buildTerminalSelectionMessage,
   createTerminalSelectionContext,
@@ -80,9 +83,20 @@ export class AgentPanel {
   private inputEl: HTMLTextAreaElement | null = null;
   private sendBtn: HTMLElement | null = null;
   private isVisible: boolean = false;
+  private disposed = false;
   private beforeShowHandler: (() => void) | null = null;
   private isAgentRunning: boolean = false;
   private activeRequestId: string | null = null;
+  private activeRunId: number | null = null;
+  private connection: 'online' | 'reconnecting' | 'syncing' | 'sync_failed' = 'online';
+  private syncId: string | null = null;
+  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  private isStopping = false;
+  private completedTextId = 0;
+  private streamingTextId = 0;
+  private endedRunId: number | null = null;
+  private lastSubmittedText = '';
+  private recoveredConfirmation: AgentSessionState['confirmation'] | null = null;
   private isWaitingConfirmation: boolean = false;
   private wsSend: ((data: string) => void) | null = null;
   private getTerminalFillTarget: (() => TerminalFillTarget) | null = null;
@@ -102,6 +116,7 @@ export class AgentPanel {
   private localeCleanup: (() => void) | null = null;
   private pendingTerminalSelection: TerminalSelectionContext | null = null;
   private agentMode: AgentExecutionMode = 'interactive';
+  private isInputComposing: boolean = false;
   private autoConfirmTimer: number | null = null;
   private autoConfirmInterval: number | null = null;
   private pendingConfirmation: {
@@ -141,7 +156,8 @@ export class AgentPanel {
   constructor(
     private parentEl: HTMLElement = document.body,
     private isLoggedIn: boolean = false,
-    private serverId?: number
+    private serverId?: number,
+    private readonly githubId?: number
   ) {
     try {
       const savedMode = localStorage.getItem(AGENT_MODE_STORAGE_KEY);
@@ -221,6 +237,102 @@ export class AgentPanel {
     this.wsSend = fn;
   }
 
+  hasActiveTask(): boolean { return this.isAgentRunning || this.isWaitingConfirmation; }
+
+  suspendConnection(): void {
+    if (this.disposed) return;
+    this.clearStateSync();
+    this.connection = 'reconnecting';
+    this.resolvePendingConfirmation(false, false, undefined, false);
+    this.recoveredConfirmation = null;
+    this.clearAutoConfirmTimers();
+    this.updateInputState();
+  }
+
+  resumeConnection(): void {
+    if (this.disposed) return;
+    this.clearAutoConfirmTimers();
+    this.clearStateSync();
+    this.connection = 'syncing';
+    const syncId = crypto.randomUUID();
+    this.syncId = syncId;
+    this.syncTimer = setTimeout(() => {
+      if (this.syncId !== syncId || this.disposed) return;
+      this.clearStateSync();
+      this.connection = 'sync_failed';
+      this.updateInputState();
+    }, 5000);
+    this.updateInputState();
+    this.wsSend?.(JSON.stringify({ type: 'agent_sync', syncId }));
+  }
+
+  private clearStateSync(): void {
+    if (this.syncTimer !== null) clearTimeout(this.syncTimer);
+    this.syncTimer = null;
+    this.syncId = null;
+  }
+
+  private applyAgentState(state: AgentSessionState): void {
+    this.clearStateSync();
+    this.connection = 'online';
+    if (state.requestId !== this.activeRequestId) {
+      this.markLastActiveMessageAborted();
+      this.streamingEl = null;
+      this.streamingText = '';
+      this.removeThinkingProcess();
+      this.completedTextId = 0;
+      this.streamingTextId = 0;
+      this.endedRunId = null;
+    }
+    this.activeRunId = state.runId;
+    this.activeRequestId = state.requestId;
+    this.isAgentRunning = state.phase !== 'idle';
+    this.isStopping = state.phase === 'stopping';
+    this.hasConfirmedSession ||= state.runId > 0;
+    this.resolvePendingConfirmation(false, false, undefined, false);
+    this.recoveredConfirmation = null;
+    this.isWaitingConfirmation = false;
+
+    const text = state.messageKey ? t(state.messageKey) : state.text;
+    if (text && state.textId > this.completedTextId) {
+      if (this.streamingEl && this.streamingTextId !== state.textId) this.convertStreamToThoughtStep();
+      if (state.textComplete) {
+        this.handleStreamEnd(text);
+        this.completedTextId = state.textId;
+      } else {
+        this.streamingText = '';
+        this.handleStreamChunk(text);
+        this.streamingTextId = state.textId;
+      }
+      if (state.textTruncated) notify(t('agent.recoveryTruncated'), { variant: 'warning' });
+    }
+    if (state.phase === 'executing') this.showExecuting(state.tool || 'execute_command', {});
+    else if (state.phase === 'thinking' && state.textComplete) this.showThinking(state.iteration);
+    else if (state.phase === 'idle') {
+      if (this.endedRunId !== state.runId && state.errorCode) {
+        this.showError(responseErrorMessage(state.errorCode, state.errorStatus));
+      }
+      this.endedRunId = state.runId;
+      if (this.streamingEl && state.outcome !== 'completed') this.markLastActiveMessageAborted();
+      this.collapseThinkingProcess();
+      if (state.runId > 0) this.saveSessionDraft(state.outcome !== 'completed');
+    }
+    if (state.phase === 'waiting_confirmation' && state.confirmation) {
+      this.recoveredConfirmation = state.confirmation;
+      this.isWaitingConfirmation = true;
+      this.showRecoveredConfirmation();
+    }
+    this.updateInputState();
+  }
+
+  private showRecoveredConfirmation(): void {
+    if (!this.recoveredConfirmation || !this.isVisible || this.connection !== 'online' ||
+      document.getElementById('terminal-section')?.classList.contains('hidden')) return;
+    const pending = this.recoveredConfirmation;
+    this.recoveredConfirmation = null;
+    this.showConfirmDialog(pending.command, pending.reason, pending.confirmationId, true);
+  }
+
   setTerminalFillHandler(
     getTarget: () => TerminalFillTarget,
     fillInput: (command: string) => boolean
@@ -230,7 +342,7 @@ export class AgentPanel {
   }
 
   render(): void {
-    if (this.panelEl) return;
+    if (this.panelEl || this.disposed) return;
 
     this.panelEl = document.createElement('div');
     this.panelEl.id = 'agent-panel';
@@ -269,6 +381,13 @@ export class AgentPanel {
               <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
               <span class="agent-desktop-close material-symbols-outlined" aria-hidden="true">close</span>
             </button>
+          </div>
+        </div>
+        <div id="agent-connection-status" class="hidden px-3 py-2 text-xs border-b border-[var(--border)] shrink-0" role="status" aria-live="polite">
+          <span data-agent-connection-message></span>
+          <div class="flex gap-2 mt-2">
+            <button type="button" data-agent-retry class="cyber-button px-2 py-1" data-i18n="agent.retrySync"></button>
+            <button type="button" data-agent-force-stop class="cyber-button px-2 py-1" data-i18n="agent.stopCurrentTask"></button>
           </div>
         </div>
         <div id="agent-memory-drawer" class="agent-memory-drawer hidden flex flex-col bg-[var(--bg)] absolute inset-x-0 top-12 bottom-0 z-20 overflow-hidden">
@@ -394,6 +513,8 @@ export class AgentPanel {
         }
       });
     });
+    this.panelEl?.querySelector('[data-agent-retry]')?.addEventListener('click', () => this.resumeConnection());
+    this.panelEl?.querySelector('[data-agent-force-stop]')?.addEventListener('click', () => this.handleStop());
     this.panelEl?.querySelector('#agent-close-btn')?.addEventListener('click', () => this.hide());
     this.panelEl?.querySelector('#agent-new-chat-btn')?.addEventListener('click', () => void this.handleNewChat());
     this.panelEl?.querySelector('#agent-memory-btn')?.addEventListener('click', () => this.toggleMemoryDrawer());
@@ -426,7 +547,22 @@ export class AgentPanel {
       }
     });
 
+    this.inputEl?.addEventListener('compositionstart', () => {
+      this.isInputComposing = true;
+    });
+    this.inputEl?.addEventListener('compositionend', () => {
+      this.isInputComposing = false;
+    });
+    this.inputEl?.addEventListener('blur', () => {
+      this.isInputComposing = false;
+    });
+
     this.inputEl?.addEventListener('keydown', (e) => {
+      // Safari can report isComposing=false on the IME confirmation Enter.
+      if (e.isComposing || this.isInputComposing || e.keyCode === 229) {
+        if (e.key === 'Escape') e.stopPropagation();
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         this.handleSend();
@@ -467,6 +603,7 @@ export class AgentPanel {
     if (!this.panelEl) return;
     this.isVisible = true;
     this.panelEl.style.display = 'flex';
+    this.showRecoveredConfirmation();
     // 强制触发 reflow 确保 CSS 平滑滑入过渡生效
     void this.panelEl.offsetWidth;
     this.panelEl.style.transform = 'translateX(0)';
@@ -524,19 +661,38 @@ export class AgentPanel {
   }
 
   handleAgentFrame(msg: any): void {
+    if (this.disposed) return;
+    if (msg.subType === 'state') {
+      if (this.syncId && msg.syncId === this.syncId && isAgentSessionState(msg.state)) {
+        this.applyAgentState(msg.state);
+      }
+      return;
+    }
+    if (this.connection === 'reconnecting') return;
+    if (msg.subType === 'error' && msg.code === 'agent_busy') {
+      if (this.inputEl && !this.inputEl.value) this.inputEl.value = this.lastSubmittedText;
+      notify(t('agent.busySync'), { variant: 'warning' });
+      this.resumeConnection();
+      return;
+    }
     // Correlation is local UI state, never an authentication credential.
     if (msg.requestId && msg.requestId !== this.activeRequestId) return;
     if (msg.requestId && !this.isAgentRunning &&
-      ['run_start', 'thinking', 'executing', 'stream_chunk', 'stream_end'].includes(msg.subType)) return;
+      ['run_start', 'thinking', 'executing', 'stream_chunk', 'stream_end', 'context_status'].includes(msg.subType)) return;
     switch (msg.subType) {
       case 'run_start':
+        this.activeRunId = typeof msg.runId === 'number' ? msg.runId : this.activeRunId;
         this.isAgentRunning = true;
         this.hasConfirmedSession = true;
         this.updateInputState();
         break;
       case 'run_end':
+        this.endedRunId = typeof msg.runId === 'number' ? msg.runId : this.activeRunId;
+        this.isStopping = false;
         this.isAgentRunning = false;
-        this.rejectPendingConfirmation(false);
+        this.resolvePendingConfirmation(false, false, undefined, false);
+        this.recoveredConfirmation = null;
+        this.isWaitingConfirmation = false;
         if (this.streamingEl) this.markLastActiveMessageAborted();
         this.collapseThinkingProcess();
         this.saveSessionDraft(msg.outcome !== 'completed');
@@ -549,32 +705,37 @@ export class AgentPanel {
         this.showExecuting(msg.tool, msg.args);
         break;
       case 'stream_chunk':
+        if (typeof msg.textId === 'number') this.streamingTextId = msg.textId;
         this.handleStreamChunk(msg.content);
         break;
       case 'stream_end':
         this.handleStreamEnd(msg.content);
+        if (typeof msg.textId === 'number') this.completedTextId = msg.textId;
         break;
       case 'response':
         this.addAgentResponse(msg.messageKey ? t(msg.messageKey) : msg.content);
+        if (typeof msg.textId === 'number') this.completedTextId = msg.textId;
         break;
       case 'confirm_required':
         this.showConfirmDialog(msg.command, msg.reason, msg.confirmationId);
         break;
       case 'confirm_closed':
+        if (this.recoveredConfirmation?.confirmationId === msg.confirmationId) {
+          this.recoveredConfirmation = null;
+          this.isWaitingConfirmation = false;
+          this.updateInputState();
+        }
         if (this.pendingConfirmation?.confirmationId === msg.confirmationId) {
           this.resolvePendingConfirmation(false, false, msg.confirmationId, false);
         }
         break;
       case 'error':
-        this.showError(msg.code ? responseErrorMessage(msg.code, msg.status) : msg.message);
+        this.showError(msg.code ? responseErrorMessage(msg.code, msg.status, msg.diagnostics) : msg.message);
         // Pre-run SSH/auth errors have no run_end; protocol errors do.
         if (msg.runId == null) {
           this.isAgentRunning = false;
           this.updateInputState();
         }
-        break;
-      case 'progress_extend':
-        this.showProgressExtend(t('agent.progressContinue'), msg.currentIteration, msg.newMax, t('agent.progressActive'));
         break;
       case 'reset_done':
         if (this.isAgentRunning) break;
@@ -582,8 +743,18 @@ export class AgentPanel {
         this.isAgentRunning = false;
         this.updateInputState();
         break;
+      case 'context_status':
+        if (msg.compacted && msg.checkpointSource === 'local') {
+          notify(t('agent.contextLocalFallback'), { variant: 'warning' });
+        } else if (msg.compacting === true) {
+          notify(t('agent.contextCompacting'), { variant: 'info' });
+        }
+        break;
+      case 'memory_status':
+        notify(t('agent.memoryFailure'), { variant: 'warning' });
+        break;
       case 'memory_updated':
-        if (!this.isAgentRunning) this.clearSessionDraft();
+        // Cache invalidation is not task completion: a late log write must preserve interrupted drafts.
         if (this.serverId) {
           void this.fetchServerMemory();
         }
@@ -608,10 +779,15 @@ export class AgentPanel {
   /** 提交用户消息；返回 false 表示 Agent 当前不可接收新请求。 */
   sendMessage(text: string, terminalSelection: TerminalSelectionContext | null = null): boolean {
     const message = text.trim();
-    if (!message) return false;
+    if (!message || this.disposed || this.connection !== 'online' || this.isStopping) return false;
     if (this.isWaitingConfirmation) return false;
 
+    this.lastSubmittedText = message;
     this.activeRequestId = crypto.randomUUID();
+    this.activeRunId = null;
+    this.completedTextId = 0;
+    this.streamingTextId = 0;
+    this.endedRunId = null;
     const isSupersede = this.isAgentRunning;
     if (isSupersede) {
       this.markLastActiveMessageAborted();
@@ -649,16 +825,32 @@ export class AgentPanel {
   private updateInputState(): void {
     const isRunning = this.isAgentRunning;
     const isWaiting = this.isWaitingConfirmation;
+    const blocked = this.connection !== 'online';
+    const statusKey = this.connection === 'reconnecting' ? 'agent.connectionLost'
+      : this.connection === 'sync_failed' ? 'agent.syncFailed' : 'agent.syncing';
+    const status = this.panelEl?.querySelector<HTMLElement>('#agent-connection-status');
+    if (status) {
+      status.classList.toggle('hidden', !blocked && !this.isStopping);
+      status.querySelector('[data-agent-connection-message]')!.textContent =
+        t(this.isStopping ? 'agent.stopping' : statusKey);
+      status.querySelector('[data-agent-retry]')!.classList.toggle('hidden', this.connection !== 'sync_failed');
+      const stop = status.querySelector<HTMLButtonElement>('[data-agent-force-stop]')!;
+      stop.classList.toggle('hidden', this.connection === 'reconnecting');
+      stop.disabled = this.isStopping && this.connection === 'syncing';
+    }
+    const newChat = this.panelEl?.querySelector<HTMLButtonElement>('#agent-new-chat-btn');
+    if (newChat) newChat.disabled = blocked || this.isStopping;
 
     if (this.inputEl) {
-      this.inputEl.disabled = isWaiting;
-      this.inputEl.placeholder = isRunning ? t('agent.stopAndResend') : t('agent.placeholder');
+      this.inputEl.disabled = isWaiting || this.isStopping;
+      this.inputEl.placeholder = blocked ? t(statusKey)
+        : isRunning ? t('agent.stopAndResend') : t('agent.placeholder');
     }
 
     if (this.sendBtn) {
       const btn = this.sendBtn as HTMLButtonElement;
       if (isRunning) {
-        btn.disabled = false;
+        btn.disabled = blocked || this.isStopping;
         btn.classList.add('is-stopping');
         btn.title = t('agent.stop');
         btn.setAttribute('data-i18n-title', 'agent.stop');
@@ -668,7 +860,7 @@ export class AgentPanel {
         btn.classList.remove('is-stopping');
         btn.title = t('agent.send');
         btn.setAttribute('data-i18n-title', 'agent.send');
-        btn.disabled = isWaiting || !this.inputEl?.value.trim();
+        btn.disabled = blocked || isWaiting || this.isStopping || !this.inputEl?.value.trim();
         // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
         btn.innerHTML = '<span class="material-symbols-outlined" style="font-size:20px;">arrow_upward</span>';
       }
@@ -676,15 +868,15 @@ export class AgentPanel {
   }
 
   handleStop(): void {
+    if (this.disposed || this.connection === 'reconnecting') return;
     this.clearAutoConfirmTimers();
-    if (!this.isAgentRunning && !this.isWaitingConfirmation) return;
+    this.resolvePendingConfirmation(false, false, undefined, false);
+    this.recoveredConfirmation = null;
+    this.isWaitingConfirmation = false;
+    this.isStopping = true;
+    this.isAgentRunning = true;
     this.wsSend?.(JSON.stringify({ type: 'agent_stop' }));
-    if (this.isWaitingConfirmation) {
-      this.rejectPendingConfirmation(false);
-    }
-    this.isAgentRunning = false;
-    this.markLastActiveMessageAborted();
-    this.updateInputState();
+    this.resumeConnection();
   }
 
   private markLastActiveMessageAborted(): void {
@@ -708,6 +900,7 @@ export class AgentPanel {
   }
 
   private async handleNewChat(): Promise<void> {
+    if (this.disposed || this.connection !== 'online' || this.isStopping) return;
     if (this.sessionMessages.length > 0 || this.isAgentRunning) {
       const ok = await confirmAction({
         title: t('agent.newChat'),
@@ -717,15 +910,21 @@ export class AgentPanel {
       if (!ok) return;
     }
 
-    if (this.isAgentRunning) {
-      this.handleStop();
-    }
+    if (this.disposed || this.connection !== 'online') return;
+    this.clearStateSync();
     this.wsSend?.(JSON.stringify({ type: 'agent_reset' }));
     this.resetPanelState();
   }
 
   private resetPanelState(): void {
     this.activeRequestId = null;
+    this.activeRunId = null;
+    this.completedTextId = 0;
+    this.streamingTextId = 0;
+    this.endedRunId = null;
+    this.isStopping = false;
+    this.recoveredConfirmation = null;
+    this.isWaitingConfirmation = false;
     this.hasConfirmedSession = false;
     this.sessionMessages = [];
     this.clearSessionDraft();
@@ -1110,33 +1309,7 @@ export class AgentPanel {
     this.appendMessage('error', message || t('feedback.danger'));
   }
 
-  private showProgressExtend(
-    message: string,
-    currentIteration: number,
-    newMax: number,
-    reason: string
-  ): void {
-    const el = document.createElement('div');
-    el.className =
-      'agent-progress-extend p-2 rounded border border-[var(--accent)] bg-[var(--accent-bg)] text-[11px]';
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-    el.innerHTML = `
-      <div class="flex items-center gap-2">
-        <span class="material-symbols-outlined text-[14px]" style="color:var(--accent);font-variation-settings:'FILL' 1;">trending_up</span>
-        <span class="font-bold text-[var(--accent)]">${t('agent.progressTitle')}</span>
-      </div>
-      <div class="agent-progress-detail mt-1">
-        ${escapeHtml(t('agent.progressCurrent', { message, current: currentIteration, max: newMax }))}
-      </div>
-      <div class="agent-progress-detail mt-1 text-[11px]">
-        ${escapeHtml(t('agent.progressReason', { reason }))}
-      </div>
-    `;
-    this.messagesEl?.appendChild(el);
-    this.scrollToBottom();
-  }
-
-  private showConfirmDialog(command: string, reason: string, confirmationId: unknown): void {
+  private showConfirmDialog(command: string, reason: string, confirmationId: unknown, recovered = false): void {
     if (typeof confirmationId !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(confirmationId)) {
       // Fail closed for legacy/malformed requests; never send an unbound approval.
       this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command, confirmationId }));
@@ -1156,7 +1329,7 @@ export class AgentPanel {
     this.isWaitingConfirmation = true;
     this.updateInputState();
 
-    const isAuto = this.agentMode === 'auto';
+    const isAuto = !recovered && this.agentMode === 'auto';
     const el = document.createElement('div');
     el.className = 'agent-confirm p-3 rounded border border-[var(--error)] bg-[var(--error-bg)]';
     el.setAttribute('role', 'alertdialog');
@@ -1265,6 +1438,7 @@ export class AgentPanel {
   private resolvePendingConfirmation(
     approved: boolean, restoreFocus = true, expectedId?: string, notifyServer = true
   ): void {
+    if (approved && this.connection !== 'online') return;
     const pending = this.pendingConfirmation;
     if (!pending || (expectedId !== undefined && pending.confirmationId !== expectedId)) return;
     this.clearAutoConfirmTimers();
@@ -1508,7 +1682,22 @@ export class AgentPanel {
 
     saveBtn.addEventListener('click', saveAndSubmit);
 
+    let isInlineComposing = false;
+    textarea.addEventListener('compositionstart', () => {
+      isInlineComposing = true;
+    });
+    textarea.addEventListener('compositionend', () => {
+      isInlineComposing = false;
+    });
+    textarea.addEventListener('blur', () => {
+      isInlineComposing = false;
+    });
+
     textarea.addEventListener('keydown', (e) => {
+      if (e.isComposing || isInlineComposing || e.keyCode === 229) {
+        if (e.key === 'Escape') e.stopPropagation();
+        return;
+      }
       if (e.key === 'Escape') {
         e.preventDefault();
         cancel();
@@ -1524,12 +1713,20 @@ export class AgentPanel {
     newText: string,
     options: { hasTerminalSelection?: boolean; userIndex?: number }
   ): void {
-    if (!newText.trim()) return;
+    if (!newText.trim() || this.disposed || this.connection !== 'online' || this.isStopping) return;
 
     const wasRunning = this.isAgentRunning;
     if (wasRunning) {
-      this.handleStop();
+      this.resolvePendingConfirmation(false, false, undefined, false);
+      this.recoveredConfirmation = null;
+      this.isWaitingConfirmation = false;
+      this.wsSend?.(JSON.stringify({ type: 'agent_stop' }));
     }
+    this.lastSubmittedText = newText;
+    this.activeRunId = null;
+    this.completedTextId = 0;
+    this.streamingTextId = 0;
+    this.endedRunId = null;
 
     // 若当前会话属于离线草稿加载且尚未在当前连接产生过有效运行轮次，安全归一为第 0 轮
     const targetUserIndex = this.hasConfirmedSession ? (options.userIndex ?? 0) : 0;
@@ -1788,19 +1985,34 @@ export class AgentPanel {
     this.panelEl?.querySelector('#agent-resume-task-chip')?.remove();
   }
 
+  private get sessionDraftKey(): string | null {
+    return this.isLoggedIn && !this.disposed
+      ? agentSessionDraftKey(this.githubId, this.serverId)
+      : null;
+  }
+
   private loadSessionDraft(): void {
-    if (!this.serverId || !this.messagesEl) return;
+    const key = this.sessionDraftKey;
+    if (!key || !this.messagesEl) return;
     try {
-      const raw = localStorage.getItem(`cloudssh_agent_draft_${this.serverId}`);
+      const raw = localStorage.getItem(key);
       if (!raw) return;
       const draft = JSON.parse(raw);
-      if (!draft || !Array.isArray(draft.messages) || draft.messages.length === 0) return;
-      // 仅恢复 30 分钟内的中断会话；已完成或过期会话立即清理，避免与云端提炼记忆重复
+      // Never infer ownership from the current login or a colliding local server ID.
       if (
-        !draft.wasInterrupted ||
-        Date.now() - Number(draft.updatedAt || 0) > SESSION_DRAFT_TTL_MS
+        !draft || draft.githubId !== this.githubId || draft.serverId !== this.serverId ||
+        !Array.isArray(draft.messages) || draft.messages.length === 0
       ) {
-        localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
+        localStorage.removeItem(key);
+        return;
+      }
+      // 仅恢复 30 分钟内的中断会话；已完成或过期会话立即清理，避免与云端提炼记忆重复
+      const age = Date.now() - draft.updatedAt;
+      if (
+        draft.wasInterrupted !== true || !Number.isFinite(draft.updatedAt) ||
+        age < 0 || age > SESSION_DRAFT_TTL_MS
+      ) {
+        localStorage.removeItem(key);
         return;
       }
       this.sessionMessages = [...draft.messages];
@@ -1820,35 +2032,44 @@ export class AgentPanel {
   }
 
   private saveSessionDraft(isInterrupted: boolean): void {
-    if (!this.serverId) return;
-    // 任务正常完成或无消息时，立即删除本地暂存草稿，由云端记忆（WorkLog & Knowledge）全权接管
-    if (!isInterrupted || this.sessionMessages.length === 0) {
-      localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
-      return;
-    }
+    const key = this.sessionDraftKey;
+    if (!key) return;
     try {
+      // 任务正常完成或无消息时，立即删除本地暂存草稿，由云端记忆（WorkLog & Knowledge）全权接管
+      if (!isInterrupted || this.sessionMessages.length === 0) {
+        localStorage.removeItem(key);
+        return;
+      }
       const draft = {
+        githubId: this.githubId,
         serverId: this.serverId,
         updatedAt: Date.now(),
         messages: this.sessionMessages.slice(-20),
         wasInterrupted: true,
       };
-      localStorage.setItem(`cloudssh_agent_draft_${this.serverId}`, JSON.stringify(draft));
+      localStorage.setItem(key, JSON.stringify(draft));
     } catch {
-      /* ignore */
+      /* ignore unavailable storage */
     }
   }
 
   private clearSessionDraft(): void {
-    if (this.serverId) {
-      localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
+    const key = this.sessionDraftKey;
+    try {
+      if (key) localStorage.removeItem(key);
+    } catch {
+      /* ignore unavailable storage */
     }
     this.removeResumeChip();
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.clearStateSync();
+    this.recoveredConfirmation = null;
     this.rejectPendingConfirmation(false);
     this.clearAutoConfirmTimers();
+    this.wsSend = null;
     this.localeCleanup?.();
     this.localeCleanup = null;
     this.pendingTerminalSelection = null;
@@ -1857,6 +2078,7 @@ export class AgentPanel {
     this.messagesEl = null;
     this.contextEl = null;
     this.inputEl = null;
+    this.isInputComposing = false;
     this.sendBtn = null;
     this.memoryDrawerEl = null;
     this.memoryTabWorkLogBtn = null;
@@ -2391,7 +2613,7 @@ export class AgentPanel {
           <input id="agent-knowledge-key" type="text" placeholder="${t('agent.knowledgeKey')}" class="terminal-input flex-1 text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code text-primary" required maxlength="64" />
         </div>
         <div>
-          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="512"></textarea>
+          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="${KNOWLEDGE_VALUE_MAX_LENGTH}"></textarea>
         </div>
         <div class="flex justify-end gap-2">
           <button type="button" id="agent-knowledge-cancel-btn" class="px-2 py-0.5 text-xs text-muted hover:text-primary cursor-pointer">${t('agent.memoryCancel')}</button>

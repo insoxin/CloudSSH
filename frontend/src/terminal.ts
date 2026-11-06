@@ -35,6 +35,7 @@ import { confirmAction, notify } from './ui-feedback';
 const TRZSZ_MAX_DATA_CHUNK_SIZE = 2 * 1024 * 1024;
 const NON_RETRIABLE_AUTH_EVENTS = new Set([
   'auth_failed',
+  'auth_none_rejected',
   'auth_interactive_protocol_error',
   'auth_interactive_limit',
   'auth_interactive_client_unavailable',
@@ -46,6 +47,8 @@ const NON_RETRIABLE_AUTH_EVENTS = new Set([
   'session_idle_timeout',
   'output_backlog_closed',
   'packet_error',
+  'algorithm_error',
+  'host_key_invalid',
 ]);
 const RTT_HEARTBEAT_INTERVAL_MS = 5000;
 const HEARTBEAT_RESPONSE_TIMEOUT_MS = 10_000;
@@ -56,6 +59,8 @@ export interface SSHHostInfo {
   username?: string;
   /** 登录用户保存的服务器 ID，用于断线后重新申请一次性连接令牌。 */
   serverId?: number;
+  /** Cloudflare Zero Trust SSH CA 团队标识（用于断线重连或克隆时重新签发短期证书） */
+  cfSshCaTeam?: string | null;
 }
 
 export type ReconnectWebSocketFactory = () => Promise<WebSocket>;
@@ -65,8 +70,9 @@ export interface SSHConnectionConfig {
   port: number;
   username: string;
   password?: string;
-  authMethod?: 'password' | 'publickey';
+  authMethod?: 'password' | 'publickey' | 'none';
   privateKey?: string;
+  certificate?: string;
   expectedFingerprint?: string;
   /** 匿名路径手动覆盖的区域偏好（保存服务器路径不使用此字段） */
   locationHint?: string;
@@ -165,7 +171,7 @@ export class SSHTerminal {
   private sessionReady: boolean = false;
   private restoreCursorBlinkAfterReturnPrompt: boolean = false;
   private onSessionClosed?: (event: CloseEvent, willReconnect: boolean) => void;
-  private onSessionReady?: () => void;
+  private onSessionReady?: (resumed?: boolean) => void;
   private onAgentFrameHandler?: (msg: any) => void;
   private onOSDetectedHandler?: (serverId: number, os: string) => void;
   private sftpAttachUrl: string | null = null;
@@ -197,6 +203,8 @@ export class SSHTerminal {
   private imePendingBaseline: string | null = null;
   private imePendingHandled = false;
   private imeKeyupTimer: ReturnType<typeof setTimeout> | null = null;
+  private imeIsComposing = false;
+  private imeConfirmEnter = false;
   private viewportRestoreFrame: number | null = null;
   private readonly mobileConnectionRecoveryEnabled: boolean;
   private pendingHostKeyChangeSocket: WebSocket | null = null;
@@ -352,6 +360,17 @@ export class SSHTerminal {
 
     // Terminal shortcuts: Search (Ctrl+Shift+F / Cmd+F) & Clear Buffer (Cmd+K / Ctrl+Shift+K)
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        // Bind suppression to this Enter cycle, not a time window: Safari may end
+        // composition before keypress/keyup. The next keydown is evaluated afresh.
+        if (e.type === 'keydown') {
+          this.imeConfirmEnter = this.imeIsComposing || e.isComposing || e.keyCode === 229;
+        }
+        const confirming = this.imeConfirmEnter || this.imeIsComposing || e.isComposing;
+        if (e.type === 'keyup') this.imeConfirmEnter = false;
+        // Leave browser default handling intact so the IME can commit the candidate.
+        if (confirming) return false;
+      }
       const action = matchTerminalShortcut(e);
       if (action === 'search') {
         if (e.type === 'keydown') {
@@ -407,7 +426,7 @@ export class SSHTerminal {
     this.onSessionClosed = handler;
   }
 
-  setSessionReadyHandler(handler: () => void): void {
+  setSessionReadyHandler(handler: (resumed?: boolean) => void): void {
     this.onSessionReady = handler;
   }
 
@@ -752,7 +771,7 @@ export class SSHTerminal {
 
     this.terminal.open(this.container);
     this.mounted = true;
-    this.installIOSIMEFallback();
+    this.installIMEHandlers();
 
     // Load WebGL addon after terminal is opened
     try {
@@ -1038,6 +1057,7 @@ export class SSHTerminal {
             password: config.password,
             authMethod: config.authMethod,
             privateKey: config.privateKey,
+            certificate: config.certificate,
             expectedFingerprint: config.expectedFingerprint,
             ...this.getTerminalSize(),
           })
@@ -1188,7 +1208,7 @@ export class SSHTerminal {
                 'w-2 h-2 bg-[var(--color-primary)]',
                 t('terminal.connected')
               );
-            this.onSessionReady?.();
+            this.onSessionReady?.(true);
             this.startHeartbeat();
             return;
           }
@@ -1207,9 +1227,10 @@ export class SSHTerminal {
                 this.authChallengeDialog?.dismiss();
               }
               if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
+                const wasReady = this.sessionReady;
                 this.sessionReady = true;
                 this.reconnectAttempts = 0;
-                this.onSessionReady?.();
+                if (!wasReady) this.onSessionReady?.(false);
               }
               break;
             case 'error':
@@ -1460,10 +1481,10 @@ export class SSHTerminal {
   }
 
   /**
-   * xterm.js 6.0 尚未包含上游 keyCode=229 keyup 修复。这里只在 iOS-like
-   * 环境补发 xterm 未观察到的 textarea 差异；若 xterm 已产生 onData 则不重复发送。
+   * Track composition on all platforms for Enter handling. Only iOS-like devices
+   * need the xterm.js 6.0 keyCode=229 keyup fallback; onData stays authoritative.
    */
-  private installIOSIMEFallback(): void {
+  private installIMEHandlers(): void {
     if (this.imeTextarea) return;
     const textarea = this.container.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea');
     if (!textarea) return;
@@ -1473,13 +1494,19 @@ export class SSHTerminal {
     textarea.setAttribute('autocomplete', 'off');
     textarea.setAttribute('autocorrect', 'off');
     textarea.spellcheck = false;
+    textarea.addEventListener('compositionstart', this.imeCompositionStartListener, true);
+    textarea.addEventListener('compositionend', this.imeCompositionEndListener, true);
+    textarea.addEventListener('blur', this.imeBlurListener, true);
     if (!isIOSLike(navigator)) return;
     textarea.addEventListener('keydown', this.imeKeydownListener, true);
     textarea.addEventListener('keyup', this.imeKeyupListener, true);
-    textarea.addEventListener('compositionstart', this.imeCompositionStartListener, true);
   }
 
   private readonly imeKeydownListener = (event: KeyboardEvent): void => {
+    if (this.imeIsComposing || event.isComposing) {
+      this.clearIMEPendingInput();
+      return;
+    }
     if (event.keyCode !== 229 || !this.imeTextarea) return;
     if (this.imePendingBaseline === null) {
       this.imePendingBaseline = this.imeTextarea.value;
@@ -1487,15 +1514,25 @@ export class SSHTerminal {
     }
   };
 
-  private readonly imeKeyupListener = (_event: KeyboardEvent): void => {
+  private readonly imeKeyupListener = (event: KeyboardEvent): void => {
     // iOS 中文输入法只保证 keydown 使用 229；对应 keyup 可能是空格的 32、
     // 标点的 0，或其他实际键码。只要存在待处理的 229 周期就应检查差异。
+    // 在拼音输入法组词（composition）过程中，不得将中间拼音补发为按键输入。
+    if (this.imeIsComposing || event.isComposing) {
+      this.clearIMEPendingInput();
+      return;
+    }
     if (this.imePendingBaseline === null) return;
     if (this.imeKeyupTimer !== null) clearTimeout(this.imeKeyupTimer);
     // 让 xterm 自己在 keyup 或先前的 0ms fallback 中优先消费输入。
     this.imeKeyupTimer = setTimeout(() => {
       this.imeKeyupTimer = null;
-      if (!this.imePendingHandled && this.imeTextarea && this.imePendingBaseline !== null) {
+      if (
+        !this.imeIsComposing &&
+        !this.imePendingHandled &&
+        this.imeTextarea &&
+        this.imePendingBaseline !== null
+      ) {
         const diff = diffTextareaInput(this.imePendingBaseline, this.imeTextarea.value);
         if (diff) this.sendInput(diff);
       }
@@ -1504,6 +1541,18 @@ export class SSHTerminal {
   };
 
   private readonly imeCompositionStartListener = (): void => {
+    this.imeIsComposing = true;
+    this.clearIMEPendingInput();
+  };
+
+  private readonly imeCompositionEndListener = (): void => {
+    this.imeIsComposing = false;
+    this.clearIMEPendingInput();
+  };
+
+  private readonly imeBlurListener = (): void => {
+    this.imeIsComposing = false;
+    this.imeConfirmEnter = false;
     this.clearIMEPendingInput();
   };
 
@@ -1943,6 +1992,12 @@ export class SSHTerminal {
       this.imeCompositionStartListener,
       true
     );
+    this.imeTextarea?.removeEventListener(
+      'compositionend',
+      this.imeCompositionEndListener,
+      true
+    );
+    this.imeTextarea?.removeEventListener('blur', this.imeBlurListener, true);
     this.clearIMEPendingInput();
     if (this.viewportRestoreFrame !== null) cancelAnimationFrame(this.viewportRestoreFrame);
     this.viewportRestoreFrame = null;

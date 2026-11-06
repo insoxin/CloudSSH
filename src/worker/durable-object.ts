@@ -300,10 +300,23 @@ export class SSHSessionDO {
         }
       }
 
-      if (!config.host || !config.username || (!config.password && !config.privateKey)) {
+      // An explicit empty password is valid; missing/non-string credentials are not.
+      const hasCredentials =
+        config.authMethod === 'none' ||
+        (config.authMethod === 'publickey'
+          ? typeof config.privateKey === 'string' && config.privateKey.length > 0
+          : (config.authMethod === undefined || config.authMethod === 'password') &&
+            typeof config.password === 'string');
+      if (!config.host || !config.username || !hasCredentials) {
         ws.send(JSON.stringify({ type: 'error', message: 'Missing credentials' }));
         ws.close(1011, 'Invalid credentials');
         return;
+      }
+
+      if (config.authMethod === 'none') {
+        config.password = '';
+        delete config.privateKey;
+        delete config.certificate;
       }
 
       const pendingSessionName = this.pendingSessionNames.get(ws);
@@ -410,6 +423,11 @@ export class SSHSessionDO {
       return resumeReject(404, 'Session expired or not found');
     }
 
+    const policy = detached.session.getSessionPolicy();
+    if (request.headers.get('x-ssh-share-resume-only') === 'true' && policy?.source !== 'share') {
+      return resumeReject(401, 'Authentication required');
+    }
+
     // 容忍一代旧 token：弱网下轮换帧可能随新连接一起丢失，客户端会携带
     // 上一代 token 重试；直接锁死会造成永久 403。新旧两代均需过后续校验。
     const currentResumeToken = detached.resumeToken;
@@ -424,7 +442,6 @@ export class SSHSessionDO {
     }
 
     // 分享会话附加策略校验：绝对过期复核 + 设备绑定挑战验签。
-    const policy = detached.session.getSessionPolicy();
     if (policy?.source === 'share') {
       if (Date.now() >= policy.sessionExpiresAt) {
         // 宽限期内到达分享会话绝对结束时间：立即终结，不再允许恢复。
@@ -841,7 +858,13 @@ export class SSHSessionDO {
         this.env,
         config.userId,
         config.githubId,
-        { waitUntil: (promise) => this.state.waitUntil(promise) }
+        {
+          waitUntil: (promise) => this.state.waitUntil(promise),
+          colo,
+          onRttUpdated: (latestLatency, latestColo) => {
+            this.sessionBaselines.set(session, { latencyMs: latestLatency, colo: latestColo });
+          },
+        }
       );
       chainSessions.push(session);
       this.sessionChains.set(ws, chainSessions);
